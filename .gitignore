@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Warp kernel cache
+*.ptx
+*.cu
+
+# 재생성 가능한 큰 결과물 (GIF 와 loss 곡선은 README 에서 참조하므로 남긴다)
+outputs/*.npy
