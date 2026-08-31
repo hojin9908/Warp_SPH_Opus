@@ -7,5 +7,5 @@ __pycache__/
 *.ptx
 *.cu
 
-# 재생성 가능한 큰 결과물 (GIF 와 loss 곡선은 README 에서 참조하므로 남긴다)
-outputs/*.npy
+# 실행 결과물. README 에 싣는 것은 docs/ 에 따로 둔다.
+outputs/

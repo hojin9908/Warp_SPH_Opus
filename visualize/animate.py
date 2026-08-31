@@ -13,10 +13,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
 
 from source.config import Config
 from source.gen_ptl import PTL
+
+# 어두운 배경 위의 물. 느린 곳은 짙은 남색, 빠른 선단은 밝은 하늘색이 된다.
+BACKGROUND = "#0b1220"
+WALL_COLOR = "#2b3650"
+WATER_CMAP = LinearSegmentedColormap.from_list(
+    "water", ["#12306b", "#1d6fc0", "#35c6e8", "#d9f7ff"]
+)
 
 
 def figure_to_image(fig: "matplotlib.figure.Figure") -> Image.Image:
@@ -29,12 +37,15 @@ def figure_to_image(fig: "matplotlib.figure.Figure") -> Image.Image:
 def save_gif(images: list[Image.Image], path: str, fps: int) -> None:
     """프레임 리스트를 GIF 한 장으로 저장한다."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    images[0].save(
+    # 적응 팔레트로 양자화해서 색 띠가 생기지 않게 하고 파일 크기도 줄인다.
+    frames = [im.convert("P", palette=Image.ADAPTIVE, colors=128) for im in images]
+    frames[0].save(
         path,
         save_all=True,
-        append_images=images[1:],
+        append_images=frames[1:],
         duration=int(1000 / max(fps, 1)),
         loop=0,
+        optimize=True,
     )
     print(f"  저장: {path}  ({len(images)} 프레임)")
 
@@ -90,31 +101,70 @@ def forward_animation(
     ptl_type: np.ndarray,       # [#all]
     path: str,
 ) -> None:
-    """순방향 시뮬레이션 GIF. 유체는 속도 크기로 색을 준다."""
+    """순방향 시뮬레이션 GIF. 유체는 속도 크기로 색을 준다.
+
+    축과 눈금을 지우고 어두운 배경에 물 색 계열을 써서 결과 자체가 보이게 한다.
+    그림 비율은 계산 영역의 비율에 맞춰 잡아 여백을 남기지 않는다.
+    """
     is_ptl = ptl_type == PTL
     is_bnd = ~is_ptl
+    n_ptl = int(is_ptl.sum())
 
     # 튀어나간 물방울 몇 개가 색 범위를 독차지하지 않도록 99 퍼센타일로 자른다.
     speeds = np.concatenate([np.linalg.norm(v[is_ptl, :2], axis=1) for _, v in snaps])
     vmax = max(float(np.percentile(speeds, 99.0)), 1e-6)
-    ytop = max(cfg.tank_height * 0.6,
-               float(np.percentile(np.concatenate([p[is_ptl, 1] for p, _ in snaps]), 99.9)))
-    x0, x1, y0, y1 = plot_limits(cfg, ytop + 4 * cfg.dx)
+    ytop = float(np.percentile(np.concatenate([p[is_ptl, 1] for p, _ in snaps]), 99.8))
+    ytop = min(max(ytop + 3 * cfg.dx, cfg.tank_height * 0.5), cfg.tank_height * 0.8)
+    x0, x1, y0, y1 = plot_limits(cfg, ytop)
+
+    # 계산 영역 비율에 맞춰 그림 크기와 축 위치를 직접 정한다 (tight_layout 없이).
+    # 글자는 축 위쪽 여백에 두어 유체와 겹치지 않게 한다.
+    fig_w = 9.0
+    ax_x, ax_w, ax_frac = 0.015, 0.895, 0.845
+    ax_h_in = fig_w * ax_w * (y1 - y0) / (x1 - x0)
+    fig_h = ax_h_in / ax_frac
+
+    # 입자 하나가 화면에서 차지할 지름(pt)을 계산해 scatter 크기로 쓴다.
+    pt_per_data = fig_w * ax_w * 72.0 / (x1 - x0)
+    ptl_size = (1.35 * cfg.dx * pt_per_data) ** 2
 
     images: list[Image.Image] = []
     for i, (pos, vel) in enumerate(snaps):
-        fig, ax = plt.subplots(figsize=(7.0, 4.0), dpi=cfg.dpi)
+        fig = plt.figure(figsize=(fig_w, fig_h), dpi=cfg.dpi)
+        fig.patch.set_facecolor(BACKGROUND)
+        ax = fig.add_axes((ax_x, 0.02, ax_w, ax_frac))
+        ax.set_facecolor(BACKGROUND)
+
         speed = np.linalg.norm(vel[is_ptl, :2], axis=1)
-        ax.scatter(pos[is_bnd, 0], pos[is_bnd, 1], s=3, c="0.65", marker="s", linewidths=0)
-        sc = ax.scatter(pos[is_ptl, 0], pos[is_ptl, 1], s=5, c=np.minimum(speed, vmax),
-                        cmap="viridis", vmin=0.0, vmax=vmax, linewidths=0)
+        # 경계는 정사각형을 빈틈없이 붙여 벽처럼 보이게 한다.
+        ax.scatter(pos[is_bnd, 0], pos[is_bnd, 1], s=ptl_size * 1.15, c=WALL_COLOR,
+                   marker="s", linewidths=0)
+        sc = ax.scatter(pos[is_ptl, 0], pos[is_ptl, 1], s=ptl_size,
+                        c=np.minimum(speed, vmax), cmap=WATER_CMAP,
+                        vmin=0.0, vmax=vmax, linewidths=0)
+
         ax.set_xlim(x0, x1)
         ax.set_ylim(y0, y1)
         ax.set_aspect("equal")
-        ax.set_title(f"WCSPH dam break   t = {i * cfg.frame_step * cfg.dt:.3f} s"
-                     f"   step {i * cfg.frame_step}")
-        fig.colorbar(sc, ax=ax, label="|v| [m/s]", fraction=0.03)
-        fig.tight_layout()
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        fig.text(ax_x + 0.004, 0.965, f"t = {i * cfg.frame_step * cfg.dt:5.3f} s",
+                 color="#e8f4ff", fontsize=15, family="monospace", va="top")
+        fig.text(ax_x + ax_w, 0.955,
+                 f"2D WCSPH   {n_ptl} fluid + {int(is_bnd.sum())} boundary   "
+                 f"{cfg.kernel_type} kernel   h/dx = {cfg.h / cfg.dx:.2f}",
+                 color="#7f8fb0", fontsize=9, family="monospace",
+                 va="top", ha="right")
+
+        cax = fig.add_axes((ax_x + ax_w + 0.012, 0.12, 0.011, 0.55))
+        cb = fig.colorbar(sc, cax=cax)
+        cb.set_label("|v|  [m/s]", color="#9fb2d0", fontsize=8.5)
+        cb.ax.tick_params(colors="#9fb2d0", labelsize=7.5, length=2)
+        cb.outline.set_visible(False)
+
         images.append(figure_to_image(fig))
         plt.close(fig)
 

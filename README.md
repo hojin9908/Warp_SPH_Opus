@@ -1,5 +1,14 @@
 # Warp SPH — 미분 가능한 2D WCSPH Dam Break
 
+<p align="center">
+  <img src="docs/dam_break.gif" width="100%" alt="2D WCSPH dam break simulated with NVIDIA Warp">
+</p>
+
+<p align="center">
+  <sub>유체 1,764 + 경계 1,026 입자 · cubic spline · <code>h/dx = 1.3</code> · 8,800 스텝<br>
+  <code>python main.py --mode forward --dx 0.012 --n_steps 8800 --frame_step 100</code></sub>
+</p>
+
 JAX 없이 **NVIDIA Warp 만으로** 쓴 2D WCSPH dam break 시뮬레이터다.
 이웃 탐색은 Warp 내장 `HashGrid` 를 매 스텝 갱신해 동적으로 하고, 자동미분은
 `wp.Tape` 만 쓰며, 긴 시뮬레이션의 메모리는 **직접 구현한 recursive
@@ -408,15 +417,23 @@ offset --(tape0)--> pos0 --(recursive checkpoint/replay)--> pos_T --(해석적)-
 
 ## 11. 출력
 
+실행하면 `--out_dir` (기본 `outputs/`) 아래에 다음이 생긴다.
+
 | 파일 | 내용 |
 |---|---|
-| `outputs/forward.gif` | 순방향 dam break. 유체는 속도 크기로 색을 준다 |
-| `outputs/optimize.gif` | 왼쪽은 현재/목표 초기 블록, 오른쪽은 현재/목표 최종 상태 |
-| `outputs/loss_curve.png` | 손실 곡선 |
-| `outputs/simulation_trajectory.npy` | `[time, #ptl, 5(x, y, vx, vy, m)]` |
-| `outputs/boundary.npy` | `[#bnd, 5(x, y, vx, vy, m)]` |
+| `forward.gif` | 순방향 dam break. 유체는 속도 크기로 색을 준다 |
+| `optimize.gif` | 왼쪽은 현재/목표 초기 블록, 오른쪽은 현재/목표 최종 상태 |
+| `loss_curve.png` | 손실 곡선 |
+| `simulation_trajectory.npy` | `[time, #ptl, 5(x, y, vx, vy, m)]` |
+| `boundary.npy` | `[#bnd, 5(x, y, vx, vy, m)]` |
 
-뒤의 두 파일은 **Reference 코드와 같은 포맷**이라 기존 도구가 그대로 읽는다.
+<p align="center">
+  <img src="docs/optimize.gif" width="100%" alt="초기 블록 위치 복원 최적화">
+</p>
+
+`outputs/` 는 실행 결과라 저장소에서 제외했다. README 에 싣는 그림만 `docs/` 에 둔다.
+
+`.npy` 두 파일은 **Reference 코드와 같은 포맷**이라 기존 도구가 그대로 읽는다.
 
 ```python
 import numpy as np
