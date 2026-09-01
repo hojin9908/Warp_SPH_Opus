@@ -108,8 +108,7 @@ def run_check(
     is_ptl = ptl_type_np == PTL
     ox, oy = probe_offset
     print(f"입자 {n} 개 (유체 {n_ptl}), dt = {cfg.dt:.3e}, 평가점 offset = ({ox}, {oy})")
-    print(f"kernel={cfg.kernel_type}  h={cfg.h:.5f} (h/dx={cfg.h / cfg.dx:.2f})  "
-          f"use_cuda_graph={cfg.use_cuda_graph}  graph_in_grad={cfg.graph_in_grad}")
+    print(f"kernel={cfg.kernel_type}  h={cfg.h:.5f} (h/dx={cfg.h / cfg.dx:.2f})")
 
     vel0 = wp.zeros(n, dtype=wp.vec3)
 

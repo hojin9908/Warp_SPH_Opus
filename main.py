@@ -103,14 +103,6 @@ def parsing() -> dict[str, Any]:
     parser.add_argument("--grid_dim", type=int,
                         help="hash bucket count per axis", default=128)
 
-    # CUDA graph
-    parser.add_argument("--use_cuda_graph", type=str2bool,
-                        help="capture tape-free rollouts into a CUDA graph", default=True)
-    parser.add_argument("--graph_min_steps", type=int,
-                        help="minimum steps per captured graph", default=20)
-    parser.add_argument("--graph_in_grad", type=str2bool,
-                        help="also use the graph in the gradient path", default=False)
-
     # recursive checkpointing
     parser.add_argument("--ckpt_depth", type=int,
                         help="recursive checkpointing depth r", default=2)

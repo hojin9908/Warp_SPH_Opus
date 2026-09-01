@@ -92,7 +92,7 @@ def loss_and_grad(
       5) dL/dpos0  -> dL/doffset   (1) 의 테이프를 역전파)
 
     roll 은 테이프 없는 전진에 쓰는 작업 공간이다. 최적화 반복 전체가 하나를
-    돌려 쓰면 CUDA graph 를 한 번만 캡처한다.
+    돌려 쓴다.
 
     return: (loss, pos_final)
     """
@@ -103,9 +103,7 @@ def loss_and_grad(
     pos0 = ptl_place(cfg, base_pos, offset, ptl_type, tape=tape0)    # [#all, 3]
     vel0 = wp.zeros(n, dtype=wp.vec3, requires_grad=True)            # [#all, 3]
 
-    # loss 를 재는 전진도 checkpoint 재현과 같은 경로여야 씨앗 adjoint 가 정확하다.
-    pos_final, _, _ = sim.simulate(cfg, pos0, vel0, ptl_type, n_steps, roll=roll,
-                                   allow_graph=cfg.graph_in_grad)
+    pos_final, _, _ = sim.simulate(cfg, pos0, vel0, ptl_type, n_steps, roll=roll)
     loss = loss_value(pos_final, pos_target, ptl_type, inv_n)
 
     seed_gpos = wp.zeros(n, dtype=wp.vec3)                           # [#all, 3]
@@ -146,7 +144,7 @@ def optimization(
     """
     offset = offset_array(cfg.init_offset_x, cfg.init_offset_y)
     opt = Adam([offset], lr=cfg.opt_lr)
-    roll = sim.Rollout(cfg, ptl_type.shape[0])   # 반복 전체가 공유한다 (그래프 캡처 1회)
+    roll = sim.Rollout(cfg, ptl_type.shape[0])   # 반복 전체가 버퍼를 공유한다
     true_off = np.array([cfg.true_offset_x, cfg.true_offset_y])
 
     history: list[dict[str, Any]] = []

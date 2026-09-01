@@ -24,8 +24,6 @@ def segment_length(cfg: Config, n: int, depth: int) -> int:
     """깊이 depth 에서 한 세그먼트의 길이.
 
     세그먼트 개수가 n^(1/(depth+1)) 이 되게 잡는다.
-    graph_in_grad 를 켰을 때만 그래프 블록의 배수로 맞춘다. 그래야 세그먼트
-    시작점과 길이가 블록에 정렬되어 1단계 전진이 그래프를 탈 수 있다.
 
     cfg: 설정값 묶음
     n: 이 구간의 스텝 수
@@ -33,9 +31,6 @@ def segment_length(cfg: Config, n: int, depth: int) -> int:
     """
     L = math.ceil(n ** (depth / (depth + 1.0)))
     L = max(L, cfg.ckpt_min_segment)
-    if cfg.use_cuda_graph and cfg.graph_in_grad:
-        b = cfg.graph_block
-        L = max(b, int(round(L / b)) * b)
     return min(L, n)
 
 
@@ -70,8 +65,6 @@ def backward_taped(
     works = [sim.Work(n, requires_grad=True) for _ in range(n_steps)]
     grids = [sim.new_grid(cfg) for _ in range(n_steps)]     # 파이썬 리스트로 붙잡아 둔다
 
-    # 테이프에 기록하는 구간은 CUDA graph 로 묶지 않는다. 테이프가 런치를 파이썬
-    # 쪽에서 기록해야 하고, backward 가 그 기록을 되짚어 다시 런치하기 때문이다.
     tape = wp.Tape()
     for t in range(n_steps):
         sim.grid_build(cfg, grids[t], pos[t])               # tape 밖
@@ -111,8 +104,7 @@ def backward_rollout(
     step0: 전역 스텝 번호의 시작값
     seed_gpos, seed_gvel: 구간 끝 상태의 adjoint
     depth: 남은 checkpointing 깊이
-    roll: 1단계 전진에 쓸 작업 공간. 재귀 전체가 하나를 돌려 쓰면
-        CUDA graph 를 한 번만 캡처한다
+    roll: 1단계 전진에 쓸 작업 공간. 재귀 전체가 하나를 돌려 쓴다
 
     return: 구간 시작 상태의 adjoint
     """
@@ -132,8 +124,7 @@ def backward_rollout(
     for seg in range(K):
         m = min(L, n_steps - seg * L)
         pos_n, vel_n, _ = sim.simulate(cfg, ck_pos[seg], ck_vel[seg], ptl_type, m,
-                                       step0=step0 + seg * L, roll=roll,
-                                       allow_graph=cfg.graph_in_grad)
+                                       step0=step0 + seg * L, roll=roll)
         ck_pos.append(wp.clone(pos_n, requires_grad=True))
         ck_vel.append(wp.clone(vel_n, requires_grad=True))
 

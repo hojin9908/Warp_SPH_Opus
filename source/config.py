@@ -10,7 +10,7 @@ class Config:
 
     main.py 의 argparse 플래그 이름이 이 클래스의 필드 이름과 1:1 로 같다.
     그래서 Config(**args) 한 줄로 만들어진다.
-    h, 지지 반경, 질량, Tait 상수 B, dt, CUDA graph 블록 길이 같은 파생값은
+    h, 지지 반경, 질량, Tait 상수 B, dt 같은 파생값은
     __post_init__ 에서 계산한다.
 
     device: 계산에 쓸 디바이스 ("cuda:0", "cpu" ...)
@@ -41,9 +41,6 @@ class Config:
     n_steps: 순방향 시뮬레이션 스텝 수
     frame_step: GIF 프레임을 남길 스텝 간격
     grid_dim: HashGrid 해시 버킷 한 변의 개수
-    use_cuda_graph: 테이프 없는 전진 구간을 CUDA graph 로 묶을지
-    graph_min_steps: 그래프 하나가 담을 최소 스텝 수
-    graph_in_grad: 그래디언트 경로에서도 그래프를 쓸지 (README 5절 참고)
     ckpt_depth: recursive checkpointing 깊이 r
     ckpt_min_segment: 이보다 짧은 구간은 통째로 테이프에 올린다
     opt_steps: 최적화 반복 횟수
@@ -99,10 +96,6 @@ class Config:
     # hash grid
     grid_dim: int = 128
 
-    # CUDA graph
-    use_cuda_graph: bool = True
-    graph_min_steps: int = 20
-    graph_in_grad: bool = False
 
     # recursive checkpointing
     ckpt_depth: int = 2
@@ -156,12 +149,6 @@ class Config:
             0.5 * self.tank_height - self.fluid_origin_y,
         )
 
-        # CUDA graph 한 덩어리의 스텝 수.
-        #  - Shepard 주기의 배수여야 그래프 안의 분기 패턴이 매 블록 같다.
-        #  - 짝수여야 ping-pong 버퍼가 그래프 끝에서 제자리로 돌아온다.
-        period = self.shepard_step if (self.shepard and self.shepard_step > 0) else 1
-        block = period * max(1, math.ceil(self.graph_min_steps / period))
-        self.graph_block: int = block * 2 if block % 2 == 1 else block
 
     def to_dict(self) -> dict[str, Any]:
         """dataclass 필드만 dict 로 돌려준다. 자동 계산이었던 값은 0 인 채로 남긴다."""
@@ -189,7 +176,5 @@ class Config:
             f"gamma={self.gamma}  mu={self.mu}\n"
             f"dt={self.dt:.3e}  n_steps={self.n_steps}  shepard={self.shepard}"
             f"(every {self.shepard_step})  bnd_layer={self.bnd_layer}\n"
-            f"ckpt_depth={self.ckpt_depth}  ckpt_min_segment={self.ckpt_min_segment}\n"
-            f"use_cuda_graph={self.use_cuda_graph}  graph_block={self.graph_block}"
-            f"  graph_in_grad={self.graph_in_grad}"
+            f"ckpt_depth={self.ckpt_depth}  ckpt_min_segment={self.ckpt_min_segment}"
         )
