@@ -161,15 +161,13 @@ def run_forward(cfg: Config, base_pos: wp.array, ptl_type: wp.array,
                 ptl_type_np: np.ndarray) -> None:
     """순방향 시뮬레이션을 돌리고 GIF 와 궤적을 저장한다."""
     print(f"\n[forward] {cfg.n_steps} 스텝  (t = {cfg.n_steps * cfg.dt:.3f} s)")
-    n = ptl_type.shape[0]
     # 순방향 데모는 유체 블록을 왼쪽 벽에 붙여 놓은 고전적인 dam break 다.
     offset = opt.offset_array(0.0, 0.0)
-    pos0 = opt.ptl_place(cfg, base_pos, offset, ptl_type)
-    vel0 = wp.zeros(n, dtype=wp.vec3)
+    s0 = opt.ptl_place(cfg, base_pos, offset, ptl_type)
 
     t0 = time.time()
-    _, _, snaps = sim.simulate(cfg, pos0, vel0, ptl_type, cfg.n_steps,
-                               snapshot_step=cfg.frame_step)
+    _, snaps = sim.simulate(cfg, s0, ptl_type, cfg.n_steps,
+                            snapshot_step=cfg.frame_step)
     wp.synchronize()
     wall = time.time() - t0
     print(f"  {wall:.2f} s  ({cfg.n_steps / wall:.0f} steps/s)")
@@ -187,12 +185,11 @@ def run_optimize(cfg: Config, base_pos: wp.array, ptl_type: wp.array,
     print("checkpoint 구성:")
     print(ckpt.checkpoint_report(cfg, cfg.opt_sim_steps))
 
-    n = ptl_type.shape[0]
     # 목표 상태: 참값 offset 으로 돌린 결과
     off_true = opt.offset_array(cfg.true_offset_x, cfg.true_offset_y)
-    pos0_true = opt.ptl_place(cfg, base_pos, off_true, ptl_type)
-    vel0 = wp.zeros(n, dtype=wp.vec3)
-    pos_target, _, _ = sim.simulate(cfg, pos0_true, vel0, ptl_type, cfg.opt_sim_steps)
+    s0_true = opt.ptl_place(cfg, base_pos, off_true, ptl_type)
+    s_target, _ = sim.simulate(cfg, s0_true, ptl_type, cfg.opt_sim_steps)
+    pos_target = s_target.pos
     print(f"목표 상태 생성 완료 (true offset = "
           f"{cfg.true_offset_x:+.4f}, {cfg.true_offset_y:+.4f})\n")
 

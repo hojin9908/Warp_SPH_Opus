@@ -61,7 +61,7 @@ python main.py --mode all --dump_config outputs/config_used.json
 main.py                     CLI (argparse) 와 실행 흐름
 source/config.py            모든 설정값과 파생값 (h, 탐색 반경, mass, B, dt)
 source/gen_ptl.py           particle_generation — 초기 유체 블록과 dam 경계
-source/kernel.py            SPH 커널 함수와 Warp kernel 전부
+source/kernel.py            State / Field 구조체, SPH 커널 함수와 Warp kernel 전부
 source/simulation.py        sph_step (한 스텝), simulate (전진), Rollout (작업 공간)
 source/checkpoint.py        recursive checkpoint / replay 역전파
 source/optimize.py          loss, 그래디언트, Adam 최적화 루프
@@ -71,6 +71,48 @@ statistic/check_grad.py     유한차분 대조와 궤적 발산 측정
 
 배열 표기는 `# [#all, 3]` 처럼 주석으로 붙였다. `#all = #ptl + #bnd` 이고
 유체 입자와 경계 입자를 한 배열에 담는다 (HashGrid 를 하나만 쓰기 위해서다).
+
+### 입자 상태는 구조체 두 개로 묶여 있다
+
+입자 하나가 갖는 값들이 커널 인자로 흩어져 있으면 읽기 어렵다. `@wp.struct` 로
+묶어 `s.pos[i]`, `fld.rho[i]` 처럼 읽는다.
+
+```python
+@wp.struct
+class State:            # 스텝 사이로 넘어가는 상태. checkpoint 가 저장하는 것.
+    pos: wp.array(dtype=wp.vec3)
+    vel: wp.array(dtype=wp.vec3)
+
+@wp.struct
+class Field:            # 한 스텝 안에서만 사는 중간값
+    rho_raw: wp.array(dtype=float)
+    rho: wp.array(dtype=float)
+    pres: wp.array(dtype=float)
+    acc: wp.array(dtype=wp.vec3)
+```
+
+**둘로 나눈 이유는 자동미분 요건이다.** 상태는 스텝마다 새 배열에 써야 하지만
+(in-place 금지) 중간값은 그럴 필요가 없다. 하나로 묶으면 checkpoint 가 저장할
+것이 늘어나 메모리 이득이 사라진다. `ptl_type` 은 변하지 않는 상수라 따로 넘긴다.
+
+**성능은 그대로다.** SoA 라 메모리 배치가 배열을 따로 넘길 때와 같다.
+생성된 C++ 를 비교하면 이웃 루프 안에 배열 디스크립터 로드 한 줄이 늘 뿐인데,
+`s` 가 루프 불변이라 컴파일러가 밖으로 뺀다.
+
+```c
+// 배열을 따로 넘길 때            // State 구조체로 넘길 때
+address(pos, j)                   &(s.pos)        <- 루프 불변, 밖으로 빠진다
+load                              load
+                                  address
+                                  load
+```
+
+실측(CPU, 입자 2,790개 density 커널)으로 `0.96x`, 전체 순방향은 구조체화 전
+476 steps/s 대비 474 steps/s 로 차이가 없었다. 그래디언트는 비트 단위로 같다.
+
+입자별 값을 인터리브하는 AoS(`P[i].pos`) 도 되지만 쓰지 않았다. 메모리 배치가
+바뀌어 GPU 코얼레싱에 불리하고, 상태를 out-of-place 로 갈아끼우는 구조와도
+맞지 않는다 (rho·pres 까지 같이 복사된다).
 
 ## 3. 한 스텝
 

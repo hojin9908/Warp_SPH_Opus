@@ -1,5 +1,7 @@
 """SPH 커널 함수와 Warp kernel 모음.
 
+입자 상태는 State / Field 두 구조체로 묶여 있고 SoA 라 `s.pos[i]` 처럼 읽는다.
+
 배열 표기
     #all = #ptl + #bnd   (유체 입자와 경계 입자를 한 배열에 담는다)
     위치와 속도는 wp.vec3 로 저장하지만 z 성분은 항상 0 이다. 물리는 완전히 2D 이고
@@ -34,6 +36,33 @@ R2_MIN = wp.constant(1.0e-12)
 # 정규화 상수 중 h 에 의존하지 않는 부분. 전체 상수는 이 값 / h^2 다.
 CUBIC_NORM = wp.constant(10.0 / (7.0 * math.pi))        # 2D cubic spline
 WENDLAND_NORM = wp.constant(7.0 / (4.0 * math.pi))      # 2D Wendland C2
+
+
+# ---------------------------------------------------------------- 입자 구조체
+@wp.struct
+class State:
+    """스텝 사이로 넘어가는 입자 상태. checkpoint 가 저장하는 것이 이것뿐이다.
+
+    SoA 라 커널 안에서 `s.pos[i]` 로 읽는다. 배열을 따로 넘기는 것과 메모리
+    배치가 같아서 성능 차이가 없다 (생성된 코드에서 늘어나는 것은 루프 불변인
+    배열 디스크립터 로드 한 줄뿐이라 컴파일러가 루프 밖으로 뺀다).
+    """
+    pos: wp.array(dtype=wp.vec3)        # [#all, 3]
+    vel: wp.array(dtype=wp.vec3)        # [#all, 3]
+
+
+@wp.struct
+class Field:
+    """한 스텝 안에서만 사는 중간값.
+
+    상태(State)와 나눠 둔 이유는 자동미분 요건이다. 상태는 스텝마다 새 배열에
+    써야 하지만(in-place 금지) 중간값은 그럴 필요가 없다. 묶어 두면 checkpoint
+    가 저장할 것이 늘어나 메모리 이득이 사라진다.
+    """
+    rho_raw: wp.array(dtype=float)      # [#all]  커널 합 그대로의 밀도
+    rho: wp.array(dtype=float)          # [#all]  보정까지 끝난 밀도
+    pres: wp.array(dtype=float)         # [#all]
+    acc: wp.array(dtype=wp.vec3)        # [#all, 3]
 
 
 # ---------------------------------------------------------------- SPH 커널 함수
@@ -92,54 +121,53 @@ def place_ptl(
     base_pos: wp.array(dtype=wp.vec3),      # [#all, 3]
     offset: wp.array(dtype=wp.vec3),        # [1, 3]
     ptl_type: wp.array(dtype=wp.int32),     # [#all]
-    pos: wp.array(dtype=wp.vec3),           # [#all, 3]  (출력)
+    s: State,                               # (출력) s.pos 만 쓴다
 ) -> None:
     """유체 입자만 offset 만큼 평행이동한다. 최적화의 미분 대상이 offset 이다."""
     i = wp.tid()
     if ptl_type[i] == PTL:
-        pos[i] = base_pos[i] + offset[0]
+        s.pos[i] = base_pos[i] + offset[0]
     else:
-        pos[i] = base_pos[i]
+        s.pos[i] = base_pos[i]
 
 
 # ---------------------------------------------------------------- 1. 밀도
 @wp.kernel
 def density_cal(
     grid: wp.uint64,
-    pos: wp.array(dtype=wp.vec3),           # [#all, 3]
+    s: State,
+    fld: Field,                             # (출력) fld.rho_raw
     h: float,
     mass: float,
     support: float,
     ker: int,
-    rho: wp.array(dtype=float),             # [#all]  (출력)
 ) -> None:
     """rho_i = m * sum_j W(|x_i - x_j|, h). 경계 입자도 합에 들어간다."""
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)     # 공간 정렬된 slot -> 원래 입자 번호
-    pos_i = pos[i]
+    pos_i = s.pos[i]
 
-    s = kernel_w(0.0, h, ker)                # 자기 자신. r 이 항상 0 이라 상수다
+    acc = kernel_w(0.0, h, ker)              # 자기 자신. r 이 항상 0 이라 상수다
     for j in wp.hash_grid_query(grid, pos_i, support):
-        r_vec = pos_i - pos[j]
+        r_vec = pos_i - s.pos[j]
         r2 = wp.dot(r_vec, r_vec)
         if r2 > R2_MIN:
             if r2 < support * support:       # 셀 후보를 실제 지지 반경으로 거른다
-                s = s + kernel_w(wp.sqrt(r2), h, ker)
+                acc = acc + kernel_w(wp.sqrt(r2), h, ker)
 
-    rho[i] = mass * s
+    fld.rho_raw[i] = mass * acc
 
 
 # ---------------------------------------------------------------- 2. 밀도 보정
 @wp.kernel
 def shepard_filter(
     grid: wp.uint64,
-    pos: wp.array(dtype=wp.vec3),           # [#all, 3]
+    s: State,
+    fld: Field,                             # rho_raw 를 읽어 rho 에 쓴다
     h: float,
-    rho_in: wp.array(dtype=float),          # [#all]
     mass: float,
     support: float,
     ker: int,
-    rho_out: wp.array(dtype=float),         # [#all]  (출력)
 ) -> None:
     """rho_i <- sum_j m W_ij / sum_j (m/rho_j) W_ij.
 
@@ -147,56 +175,52 @@ def shepard_filter(
     """
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
-    pos_i = pos[i]
+    pos_i = s.pos[i]
 
     w0 = kernel_w(0.0, h, ker)
     num = mass * w0
-    den = (mass / rho_in[i]) * w0
+    den = (mass / fld.rho_raw[i]) * w0
     for j in wp.hash_grid_query(grid, pos_i, support):
-        r_vec = pos_i - pos[j]
+        r_vec = pos_i - s.pos[j]
         r2 = wp.dot(r_vec, r_vec)
         if r2 > R2_MIN:
             if r2 < support * support:
                 w = kernel_w(wp.sqrt(r2), h, ker)
                 num = num + mass * w
-                den = den + (mass / rho_in[j]) * w
+                den = den + (mass / fld.rho_raw[j]) * w
 
-    rho_out[i] = num / den
+    fld.rho[i] = num / den
 
 
 # ---------------------------------------------------------------- 3. 압력
 @wp.kernel
 def pres_cal(
-    rho: wp.array(dtype=float),             # [#all]
+    fld: Field,                             # rho 를 읽어 pres 에 쓴다
     rho0: float,
     B: float,
     gamma: float,
     clamp_negative: int,
-    pres: wp.array(dtype=float),            # [#all]  (출력)
 ) -> None:
     """Tait 상태방정식  p = B((rho/rho0)^gamma - 1)."""
     i = wp.tid()
-    q = wp.pow(rho[i] / rho0, gamma) - 1.0
+    q = wp.pow(fld.rho[i] / rho0, gamma) - 1.0
     if clamp_negative == 1:
         q = wp.max(q, 0.0)
-    pres[i] = B * q
+    fld.pres[i] = B * q
 
 
 # ---------------------------------------------------------------- 4. 힘
 @wp.kernel
 def force_cal(
     grid: wp.uint64,
-    pos: wp.array(dtype=wp.vec3),           # [#all, 3]
-    vel: wp.array(dtype=wp.vec3),           # [#all, 3]
+    s: State,
+    fld: Field,                             # rho, pres 를 읽어 acc 에 쓴다
     h: float,
-    rho: wp.array(dtype=float),             # [#all]
-    pres: wp.array(dtype=float),            # [#all]
     mass: float,
     support: float,
     ker: int,
     mu: float,
     g: float,
-    acc: wp.array(dtype=wp.vec3),           # [#all, 3]  (출력)
 ) -> None:
     """압력력(대칭형) + 점성력(Morris) + 중력.
 
@@ -208,43 +232,41 @@ def force_cal(
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
 
-    pos_i = pos[i]
-    vel_i = vel[i]
-    rho_i = rho[i]
-    pres_i = pres[i]
+    pos_i = s.pos[i]
+    vel_i = s.vel[i]
+    rho_i = fld.rho[i]
+    pres_i = fld.pres[i]
 
     a = wp.vec3(0.0, 0.0, 0.0)
     for j in wp.hash_grid_query(grid, pos_i, support):
-        r_vec = pos_i - pos[j]
+        r_vec = pos_i - s.pos[j]
         r2 = wp.dot(r_vec, r_vec)
         if r2 > R2_MIN:
             if r2 < support * support:
                 r = wp.sqrt(r2)
                 grad_w = kernel_dwdr(r, h, ker) * (r_vec / r)        # grad_i W_ij
-                rho_j = rho[j]
+                rho_j = fld.rho[j]
 
                 # 압력력: -m (p_i/rho_i^2 + p_j/rho_j^2) grad W
                 a = a - mass * (pres_i / (rho_i * rho_i)
-                                + pres[j] / (rho_j * rho_j)) * grad_w
+                                + fld.pres[j] / (rho_j * rho_j)) * grad_w
 
                 # 점성력: Morris 형. dot(r_vec, grad_w) < 0 이라 속도 차를 감쇠시킨다
                 visc = 2.0 * mu * wp.dot(r_vec, grad_w) \
                     / (rho_i * rho_j * (r2 + 0.01 * h * h))
-                a = a + mass * visc * (vel_i - vel[j])
+                a = a + mass * visc * (vel_i - s.vel[j])
 
-    acc[i] = a + wp.vec3(0.0, -g, 0.0)
+    fld.acc[i] = a + wp.vec3(0.0, -g, 0.0)
 
 
 # ---------------------------------------------------------------- 5. 적분
 @wp.kernel
 def vel_pos_step(
-    pos_in: wp.array(dtype=wp.vec3),        # [#all, 3]
-    vel_in: wp.array(dtype=wp.vec3),        # [#all, 3]
-    acc: wp.array(dtype=wp.vec3),           # [#all, 3]
+    s_in: State,
+    fld: Field,
     ptl_type: wp.array(dtype=wp.int32),     # [#all]
     dt: float,
-    pos_out: wp.array(dtype=wp.vec3),       # [#all, 3]  (출력)
-    vel_out: wp.array(dtype=wp.vec3),       # [#all, 3]  (출력)
+    s_out: State,                           # (출력) 입력과 반드시 다른 배열이어야 한다
 ) -> None:
     """semi-implicit Euler. 경계 입자는 움직이지 않는다.
 
@@ -253,18 +275,18 @@ def vel_pos_step(
     """
     i = wp.tid()
     if ptl_type[i] == PTL:
-        v_new = vel_in[i] + acc[i] * dt
-        vel_out[i] = v_new
-        pos_out[i] = pos_in[i] + v_new * dt
+        v_new = s_in.vel[i] + fld.acc[i] * dt
+        s_out.vel[i] = v_new
+        s_out.pos[i] = s_in.pos[i] + v_new * dt
     else:
-        vel_out[i] = vel_in[i]
-        pos_out[i] = pos_in[i]
+        s_out.vel[i] = s_in.vel[i]
+        s_out.pos[i] = s_in.pos[i]
 
 
 # ---------------------------------------------------------------- 손실
 @wp.kernel
 def loss_cal(
-    pos: wp.array(dtype=wp.vec3),           # [#all, 3]
+    s: State,
     pos_target: wp.array(dtype=wp.vec3),    # [#all, 3]
     ptl_type: wp.array(dtype=wp.int32),     # [#all]
     inv_n: float,
@@ -273,13 +295,13 @@ def loss_cal(
     """L = (1/n_ptl) * sum_ptl |x_i - x_target_i|^2"""
     i = wp.tid()
     if ptl_type[i] == PTL:
-        d = pos[i] - pos_target[i]
+        d = s.pos[i] - pos_target[i]
         wp.atomic_add(loss, 0, inv_n * wp.dot(d, d))
 
 
 @wp.kernel
 def loss_seed_cal(
-    pos: wp.array(dtype=wp.vec3),           # [#all, 3]
+    s: State,
     pos_target: wp.array(dtype=wp.vec3),    # [#all, 3]
     ptl_type: wp.array(dtype=wp.int32),     # [#all]
     inv_n: float,
@@ -288,6 +310,6 @@ def loss_seed_cal(
     """dL/dx_T 를 해석적으로 채운다. 역전파의 씨앗이다."""
     i = wp.tid()
     if ptl_type[i] == PTL:
-        seed[i] = 2.0 * inv_n * (pos[i] - pos_target[i])
+        seed[i] = 2.0 * inv_n * (s.pos[i] - pos_target[i])
     else:
         seed[i] = wp.vec3(0.0, 0.0, 0.0)

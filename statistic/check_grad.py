@@ -51,10 +51,9 @@ def loss_only(
 ) -> float:
     """그래디언트 없이 loss 만 계산한다 (유한차분용)."""
     offset = opt.offset_array(ox, oy)
-    pos0 = opt.ptl_place(cfg, base_pos, offset, ptl_type)
-    vel0 = wp.zeros(ptl_type.shape[0], dtype=wp.vec3)
-    pos_final, _, _ = sim.simulate(cfg, pos0, vel0, ptl_type, n_steps)
-    return opt.loss_value(pos_final, pos_target, ptl_type, 1.0 / n_ptl)
+    s0 = opt.ptl_place(cfg, base_pos, offset, ptl_type)
+    s_final, _ = sim.simulate(cfg, s0, ptl_type, n_steps)
+    return opt.loss_value(s_final, pos_target, ptl_type, 1.0 / n_ptl)
 
 
 def finite_difference(
@@ -110,21 +109,20 @@ def run_check(
     print(f"입자 {n} 개 (유체 {n_ptl}), dt = {cfg.dt:.3e}, 평가점 offset = ({ox}, {oy})")
     print(f"kernel={cfg.kernel_type}  h={cfg.h:.5f} (h/dx={cfg.h / cfg.dx:.2f})")
 
-    vel0 = wp.zeros(n, dtype=wp.vec3)
-
-    def final_state(T: int, a: float, b: float) -> wp.array:
+    def final_pos(T: int, a: float, b: float) -> np.ndarray:
+        """T 스텝 뒤의 위치를 numpy 로 돌려준다."""
         offset = opt.offset_array(a, b)
-        pos0 = opt.ptl_place(cfg, base_pos, offset, ptl_type)
-        pos, _, _ = sim.simulate(cfg, pos0, vel0, ptl_type, T)
-        return pos
+        s0 = opt.ptl_place(cfg, base_pos, offset, ptl_type)
+        s_final, _ = sim.simulate(cfg, s0, ptl_type, T)
+        return s_final.pos
 
     # ---------- 1) 궤적 발산: 어디까지가 미분이 쓸모 있는 구간인지 먼저 잰다 ----------
     print("\n[1] 궤적 발산: offset 을 1e-6 만큼 바꿨을 때 최종 위치 차이의 증폭률")
     print(f"{'T':>6} {'mean|dx|':>12} {'max|dx|':>12} {'증폭':>12}")
     amp: dict[int, float] = {}
     for T in horizons:
-        a = final_state(T, ox, oy).numpy()
-        b = final_state(T, ox + 1e-6, oy).numpy()
+        a = final_pos(T, ox, oy).numpy()
+        b = final_pos(T, ox + 1e-6, oy).numpy()
         d = np.linalg.norm((a - b)[is_ptl, :2], axis=1)
         amp[T] = float(d.mean() / 1e-6)
         print(f"{T:6d} {d.mean():12.3e} {d.max():12.3e} {amp[T]:12.3e}")
@@ -137,7 +135,7 @@ def run_check(
     ok = True
     usable = 0
     for T in horizons:
-        pos_target = final_state(T, cfg.true_offset_x, cfg.true_offset_y)
+        pos_target = final_pos(T, cfg.true_offset_x, cfg.true_offset_y)
         l_full, g_full = grad_of_offset(cfg, base_pos, ptl_type, pos_target, n_ptl,
                                         T, ox, oy, 0)
         _, g_ck = grad_of_offset(cfg, base_pos, ptl_type, pos_target, n_ptl,

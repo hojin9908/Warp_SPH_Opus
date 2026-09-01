@@ -16,6 +16,7 @@ import math
 
 import warp as wp
 
+from source import kernel as kn
 from source import simulation as sim
 from source.config import Config
 
@@ -36,8 +37,7 @@ def segment_length(cfg: Config, n: int, depth: int) -> int:
 
 def backward_taped(
     cfg: Config,
-    pos0: wp.array,             # [#all, 3]
-    vel0: wp.array,             # [#all, 3]
+    s0: kn.State,
     ptl_type: wp.array,         # [#all]
     n_steps: int,
     step0: int,
@@ -47,7 +47,7 @@ def backward_taped(
     """n_steps 전부를 한 테이프에 기록하고 역전파한다 (재귀의 바닥).
 
     cfg: 설정값 묶음
-    pos0, vel0: 구간 시작 상태 (requires_grad=True 여야 한다)
+    s0: 구간 시작 상태 (requires_grad=True 여야 한다)
     ptl_type: 입자 종류
     n_steps: 이 구간의 스텝 수
     step0: 전역 스텝 번호의 시작값
@@ -57,36 +57,33 @@ def backward_taped(
     """
     n = ptl_type.shape[0]
 
-    # 스텝마다 별도의 상태 배열 / 작업 버퍼 / HashGrid 를 잡는다.
-    pos = [pos0] + [wp.zeros(n, dtype=wp.vec3, requires_grad=True)
-                    for _ in range(n_steps)]                # [(n_steps+1)][#all, 3]
-    vel = [vel0] + [wp.zeros(n, dtype=wp.vec3, requires_grad=True)
-                    for _ in range(n_steps)]                # [(n_steps+1)][#all, 3]
-    works = [sim.Work(n, requires_grad=True) for _ in range(n_steps)]
+    # 스텝마다 별도의 상태 / 중간값 버퍼 / HashGrid 를 잡는다.
+    states = [s0] + [sim.new_state(n, requires_grad=True) for _ in range(n_steps)]
+    flds = [sim.new_field(n, requires_grad=True) for _ in range(n_steps)]
     grids = [sim.new_grid(cfg) for _ in range(n_steps)]     # 파이썬 리스트로 붙잡아 둔다
 
     tape = wp.Tape()
     for t in range(n_steps):
-        sim.grid_build(cfg, grids[t], pos[t])               # tape 밖
+        sim.grid_build(cfg, grids[t], states[t])            # tape 밖
         with tape:
-            sim.sph_step(cfg, grids[t], pos[t], vel[t], works[t],
-                         pos[t + 1], vel[t + 1], ptl_type, step0 + t)
+            sim.sph_step(cfg, grids[t], states[t], flds[t], states[t + 1],
+                         ptl_type, step0 + t)
 
     # 구간 시작의 그래디언트를 깨끗하게 만든 뒤 역전파한다.
-    pos0.grad.zero_()
-    vel0.grad.zero_()
-    tape.backward(grads={pos[n_steps]: seed_gpos, vel[n_steps]: seed_gvel})
+    s0.pos.grad.zero_()
+    s0.vel.grad.zero_()
+    last = states[n_steps]
+    tape.backward(grads={last.pos: seed_gpos, last.vel: seed_gvel})
 
-    g_pos = wp.clone(pos0.grad, requires_grad=False)        # [#all, 3]
-    g_vel = wp.clone(vel0.grad, requires_grad=False)        # [#all, 3]
+    g_pos = wp.clone(s0.pos.grad, requires_grad=False)      # [#all, 3]
+    g_vel = wp.clone(s0.vel.grad, requires_grad=False)      # [#all, 3]
     tape.zero()
     return g_pos, g_vel
 
 
 def backward_rollout(
     cfg: Config,
-    pos0: wp.array,             # [#all, 3]
-    vel0: wp.array,             # [#all, 3]
+    s0: kn.State,
     ptl_type: wp.array,         # [#all]
     n_steps: int,
     step0: int,
@@ -98,7 +95,7 @@ def backward_rollout(
     """[step0, step0+n_steps) 구간을 역전파한다.
 
     cfg: 설정값 묶음
-    pos0, vel0: 구간 시작 상태 (requires_grad=True 여야 한다)
+    s0: 구간 시작 상태 (requires_grad=True 여야 한다)
     ptl_type: 입자 종류
     n_steps: 이 구간의 스텝 수
     step0: 전역 스텝 번호의 시작값
@@ -109,8 +106,7 @@ def backward_rollout(
     return: 구간 시작 상태의 adjoint
     """
     if depth <= 0 or n_steps <= cfg.ckpt_min_segment:
-        return backward_taped(cfg, pos0, vel0, ptl_type, n_steps, step0,
-                              seed_gpos, seed_gvel)
+        return backward_taped(cfg, s0, ptl_type, n_steps, step0, seed_gpos, seed_gvel)
 
     n = ptl_type.shape[0]
     if roll is None:
@@ -119,21 +115,18 @@ def backward_rollout(
     K = math.ceil(n_steps / L)
 
     # --- 1단계: 테이프 없이 전진하며 세그먼트 경계 상태만 저장한다 ---
-    ck_pos = [pos0]                                          # [(K+1)][#all, 3]
-    ck_vel = [vel0]                                          # [(K+1)][#all, 3]
+    ck = [s0]                                                # [(K+1)] State
     for seg in range(K):
         m = min(L, n_steps - seg * L)
-        pos_n, vel_n, _ = sim.simulate(cfg, ck_pos[seg], ck_vel[seg], ptl_type, m,
-                                       step0=step0 + seg * L, roll=roll)
-        ck_pos.append(wp.clone(pos_n, requires_grad=True))
-        ck_vel.append(wp.clone(vel_n, requires_grad=True))
+        s_n, _ = sim.simulate(cfg, ck[seg], ptl_type, m, step0=step0 + seg * L, roll=roll)
+        ck.append(sim.clone_state(s_n, requires_grad=True))
 
     # --- 2단계: 뒤에서부터 세그먼트를 하나씩 다시 기록하며 역전파한다 ---
     g_pos, g_vel = seed_gpos, seed_gvel
     for seg in reversed(range(K)):
         m = min(L, n_steps - seg * L)
         g_pos, g_vel = backward_rollout(
-            cfg, ck_pos[seg], ck_vel[seg], ptl_type, m, step0 + seg * L,
+            cfg, ck[seg], ptl_type, m, step0 + seg * L,
             g_pos, g_vel, depth - 1, roll,
         )
     return g_pos, g_vel

@@ -42,24 +42,21 @@ def ptl_place(
     offset: wp.array,           # [1, 3]
     ptl_type: wp.array,         # [#all]
     tape: wp.Tape | None = None,
-) -> wp.array:
-    """offset 으로부터 초기 위치를 만든다. tape 를 주면 기록한다.
-
-    return: pos0        # [#all, 3]
-    """
+) -> kn.State:
+    """offset 으로부터 초기 상태를 만든다. 속도는 0 이다. tape 를 주면 기록한다."""
     n = ptl_type.shape[0]
-    pos0 = wp.zeros(n, dtype=wp.vec3, requires_grad=True)
+    s0 = sim.new_state(n, requires_grad=True)
     if tape is None:
-        wp.launch(kn.place_ptl, dim=n, inputs=[base_pos, offset, ptl_type], outputs=[pos0])
+        wp.launch(kn.place_ptl, dim=n, inputs=[base_pos, offset, ptl_type], outputs=[s0])
     else:
         with tape:
             wp.launch(kn.place_ptl, dim=n, inputs=[base_pos, offset, ptl_type],
-                      outputs=[pos0])
-    return pos0
+                      outputs=[s0])
+    return s0
 
 
 def loss_value(
-    pos: wp.array,              # [#all, 3]
+    s: kn.State,
     pos_target: wp.array,       # [#all, 3]
     ptl_type: wp.array,         # [#all]
     inv_n: float,
@@ -67,7 +64,7 @@ def loss_value(
     """유체 입자 최종 위치의 평균제곱오차를 스칼라로 돌려준다."""
     n = ptl_type.shape[0]
     loss = wp.zeros(1, dtype=float)                     # [1]
-    wp.launch(kn.loss_cal, dim=n, inputs=[pos, pos_target, ptl_type, inv_n],
+    wp.launch(kn.loss_cal, dim=n, inputs=[s, pos_target, ptl_type, inv_n],
               outputs=[loss])
     return float(loss.numpy()[0])
 
@@ -81,12 +78,12 @@ def loss_and_grad(
     n_ptl: int,
     n_steps: int,
     roll: sim.Rollout | None = None,
-) -> tuple[float, wp.array]:
+) -> tuple[float, kn.State]:
     """loss 와 dL/d(offset) 을 계산한다.
 
     순서
-      1) offset -> pos0            (테이프에 기록)
-      2) pos0 -> pos_T             (테이프 없이 전진, loss 계산용)
+      1) offset -> s0              (테이프에 기록)
+      2) s0 -> s_T                 (테이프 없이 전진, loss 계산용)
       3) dL/dpos_T                 (해석적으로 씨앗을 만든다)
       4) dL/dpos_T -> dL/dpos0     (recursive checkpoint / replay)
       5) dL/dpos0  -> dL/doffset   (1) 의 테이프를 역전파)
@@ -94,33 +91,32 @@ def loss_and_grad(
     roll 은 테이프 없는 전진에 쓰는 작업 공간이다. 최적화 반복 전체가 하나를
     돌려 쓴다.
 
-    return: (loss, pos_final)
+    return: (loss, s_final)
     """
     n = ptl_type.shape[0]
     inv_n = 1.0 / float(n_ptl)
 
     tape0 = wp.Tape()
-    pos0 = ptl_place(cfg, base_pos, offset, ptl_type, tape=tape0)    # [#all, 3]
-    vel0 = wp.zeros(n, dtype=wp.vec3, requires_grad=True)            # [#all, 3]
+    s0 = ptl_place(cfg, base_pos, offset, ptl_type, tape=tape0)
 
-    pos_final, _, _ = sim.simulate(cfg, pos0, vel0, ptl_type, n_steps, roll=roll)
-    loss = loss_value(pos_final, pos_target, ptl_type, inv_n)
+    s_final, _ = sim.simulate(cfg, s0, ptl_type, n_steps, roll=roll)
+    loss = loss_value(s_final, pos_target, ptl_type, inv_n)
 
     seed_gpos = wp.zeros(n, dtype=wp.vec3)                           # [#all, 3]
     wp.launch(kn.loss_seed_cal, dim=n,
-              inputs=[pos_final, pos_target, ptl_type, inv_n], outputs=[seed_gpos])
+              inputs=[s_final, pos_target, ptl_type, inv_n], outputs=[seed_gpos])
     seed_gvel = wp.zeros(n, dtype=wp.vec3)                           # [#all, 3]
 
     g_pos0, _ = ckpt.backward_rollout(
-        cfg, pos0, vel0, ptl_type, n_steps, 0, seed_gpos, seed_gvel, cfg.ckpt_depth, roll
+        cfg, s0, ptl_type, n_steps, 0, seed_gpos, seed_gvel, cfg.ckpt_depth, roll
     )
 
     # offset 은 최적화 반복 사이에 재사용하는 배열이다. Tape.backward 는 .grad 에
     # 누적하므로 반드시 먼저 0 으로 지운다. 지우지 않으면 매 반복의 그래디언트가
     # 조용히 더해져서 최적화가 엉뚱한 방향으로 간다.
     offset.grad.zero_()
-    tape0.backward(grads={pos0: g_pos0})
-    return loss, pos_final
+    tape0.backward(grads={s0.pos: g_pos0})
+    return loss, s_final
 
 
 def optimization(
@@ -150,20 +146,20 @@ def optimization(
     history: list[dict[str, Any]] = []
     for it in range(cfg.opt_steps):
         opt.lr = cfg.opt_lr * (cfg.opt_lr_decay ** it)
-        loss, pos_final = loss_and_grad(
+        loss, s_final = loss_and_grad(
             cfg, offset, base_pos, ptl_type, pos_target, n_ptl, cfg.opt_sim_steps, roll
         )
         g = offset.grad.numpy()[0].copy()
         o = offset.numpy()[0].copy()
 
-        pos0_now = ptl_place(cfg, base_pos, offset, ptl_type)
+        s0_now = ptl_place(cfg, base_pos, offset, ptl_type)
         history.append({
             "iter": it,
             "loss": loss,
             "offset": o[:2].copy(),
             "grad": g[:2].copy(),
-            "pos0": pos0_now.numpy().copy(),            # [#all, 3]
-            "pos_final": pos_final.numpy().copy(),      # [#all, 3]
+            "pos0": s0_now.pos.numpy().copy(),          # [#all, 3]
+            "pos_final": s_final.pos.numpy().copy(),    # [#all, 3]
         })
 
         if verbose:
