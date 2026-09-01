@@ -17,7 +17,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
 
 from source.config import Config
-from source.gen_ptl import PTL
+from source.read_input import PTL
 
 # 어두운 배경 위의 물. 느린 곳은 짙은 남색, 빠른 선단은 밝은 하늘색이 된다.
 BACKGROUND = "#0b1220"

@@ -17,12 +17,14 @@ import warp as wp
 from source import optimize as opt
 from source import simulation as sim
 from source.config import Config
-from source.gen_ptl import PTL, particle_generation, to_warp
+from source.gen_ptl import particle_generation, to_warp
+from source.read_input import PTL, read_input
 
 
 def grad_of_offset(
     cfg: Config,
     base_pos: wp.array,         # [#all, 3]
+    base_vel: wp.array,         # [#all, 3]
     ptl_type: wp.array,         # [#all]
     pos_target: wp.array,       # [#all, 3]
     n_ptl: int,
@@ -35,13 +37,15 @@ def grad_of_offset(
     c = copy.copy(cfg)
     c.ckpt_depth = depth
     offset = opt.offset_array(ox, oy)
-    loss, _ = opt.loss_and_grad(c, offset, base_pos, ptl_type, pos_target, n_ptl, n_steps)
+    loss, _ = opt.loss_and_grad(c, offset, base_pos, base_vel, ptl_type, pos_target,
+                                n_ptl, n_steps)
     return loss, offset.grad.numpy()[0][:2].copy()
 
 
 def loss_only(
     cfg: Config,
     base_pos: wp.array,         # [#all, 3]
+    base_vel: wp.array,         # [#all, 3]
     ptl_type: wp.array,         # [#all]
     pos_target: wp.array,       # [#all, 3]
     n_ptl: int,
@@ -51,7 +55,7 @@ def loss_only(
 ) -> float:
     """그래디언트 없이 loss 만 계산한다 (유한차분용)."""
     offset = opt.offset_array(ox, oy)
-    s0 = opt.ptl_place(cfg, base_pos, offset, ptl_type)
+    s0 = opt.ptl_place(cfg, base_pos, base_vel, offset, ptl_type)
     s_final, _ = sim.simulate(cfg, s0, ptl_type, n_steps)
     return opt.loss_value(s_final, pos_target, ptl_type, 1.0 / n_ptl)
 
@@ -59,6 +63,7 @@ def loss_only(
 def finite_difference(
     cfg: Config,
     base_pos: wp.array,         # [#all, 3]
+    base_vel: wp.array,         # [#all, 3]
     ptl_type: wp.array,         # [#all]
     pos_target: wp.array,       # [#all, 3]
     n_ptl: int,
@@ -75,10 +80,10 @@ def finite_difference(
     for d in range(2):
         p = [ox, oy]
         p[d] += eps
-        lp = loss_only(cfg, base_pos, ptl_type, pos_target, n_ptl, n_steps, p[0], p[1])
+        lp = loss_only(cfg, base_pos, base_vel, ptl_type, pos_target, n_ptl, n_steps, p[0], p[1])
         p = [ox, oy]
         p[d] -= eps
-        lm = loss_only(cfg, base_pos, ptl_type, pos_target, n_ptl, n_steps, p[0], p[1])
+        lm = loss_only(cfg, base_pos, base_vel, ptl_type, pos_target, n_ptl, n_steps, p[0], p[1])
         g[d] = (lp - lm) / (2.0 * eps)
     return g
 
@@ -100,9 +105,13 @@ def run_check(
     amp_limit: 이 증폭률 이하 구간에서만 checkpointing 일치를 판정한다
     fd_limit: 자동미분과 유한차분이 이 상대오차 안이면 "쓸 만한 구간"으로 본다
     """
-    gen = particle_generation(cfg)
-    base_np, ptl_type_np, n_ptl = gen.build()
-    base_pos, ptl_type = to_warp(base_np, ptl_type_np)
+    if cfg.input_file:
+        inp = read_input(cfg.input_file)
+        cfg.override_from_input(inp.mass, inp.h)
+        pos_np, vel_np, ptl_type_np, n_ptl = inp.pos, inp.vel, inp.ptl_type, inp.n_ptl
+    else:
+        pos_np, vel_np, ptl_type_np, n_ptl = particle_generation(cfg).build()
+    base_pos, base_vel, ptl_type = to_warp(pos_np, vel_np, ptl_type_np)
     n = len(ptl_type_np)
     is_ptl = ptl_type_np == PTL
     ox, oy = probe_offset
@@ -112,7 +121,7 @@ def run_check(
     def final_pos(T: int, a: float, b: float) -> np.ndarray:
         """T 스텝 뒤의 위치를 numpy 로 돌려준다."""
         offset = opt.offset_array(a, b)
-        s0 = opt.ptl_place(cfg, base_pos, offset, ptl_type)
+        s0 = opt.ptl_place(cfg, base_pos, base_vel, offset, ptl_type)
         s_final, _ = sim.simulate(cfg, s0, ptl_type, T)
         return s_final.pos
 
@@ -136,12 +145,12 @@ def run_check(
     usable = 0
     for T in horizons:
         pos_target = final_pos(T, cfg.true_offset_x, cfg.true_offset_y)
-        l_full, g_full = grad_of_offset(cfg, base_pos, ptl_type, pos_target, n_ptl,
-                                        T, ox, oy, 0)
-        _, g_ck = grad_of_offset(cfg, base_pos, ptl_type, pos_target, n_ptl,
-                                 T, ox, oy, cfg.ckpt_depth)
-        g_fd = finite_difference(cfg, base_pos, ptl_type, pos_target, n_ptl,
-                                 T, ox, oy, eps)
+        l_full, g_full = grad_of_offset(cfg, base_pos, base_vel, ptl_type, pos_target,
+                                        n_ptl, T, ox, oy, 0)
+        _, g_ck = grad_of_offset(cfg, base_pos, base_vel, ptl_type, pos_target,
+                                 n_ptl, T, ox, oy, cfg.ckpt_depth)
+        g_fd = finite_difference(cfg, base_pos, base_vel, ptl_type, pos_target,
+                                 n_ptl, T, ox, oy, eps)
 
         scale = max(float(np.abs(g_full).max()), 1e-12)
         e_ck = float(np.abs(g_ck - g_full).max()) / scale

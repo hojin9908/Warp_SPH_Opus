@@ -19,6 +19,7 @@ from source import optimize as opt
 from source import simulation as sim
 from source.config import Config
 from source.gen_ptl import particle_generation, to_warp
+from source.read_input import read_input, write_input
 from visualize import animate
 
 
@@ -47,6 +48,12 @@ def parsing() -> dict[str, Any]:
     parser.add_argument("--device", type=str, help="device to use", default="cuda:0")
     parser.add_argument("--out_dir", type=str, help="directory to save results",
                         default="outputs")
+    parser.add_argument("--input_file", type=str,
+                        help="SOPHIA-format particle input file; empty to generate",
+                        default="")
+    parser.add_argument("--dump_input", type=str,
+                        help="write the generated particles in SOPHIA format",
+                        default="")
     parser.add_argument("--seed", type=int, help="random seed", default=123)
 
     # simulation setting
@@ -137,33 +144,47 @@ def parsing() -> dict[str, Any]:
     return args
 
 
-def setup(cfg: Config) -> tuple[wp.array, wp.array, np.ndarray, int]:
-    """디바이스를 잡고 초기 입자를 만든다.
+def setup(cfg: Config) -> tuple[wp.array, wp.array, wp.array, np.ndarray, int]:
+    """디바이스를 잡고 초기 입자를 준비한다.
 
-    return: (base_pos, ptl_type, ptl_type_numpy, n_ptl)
+    --input_file 을 주면 SOPHIA 형식 파일에서 읽고, 아니면 설정값으로 생성한다.
+
+    return: (base_pos, base_vel, ptl_type, ptl_type_numpy, n_ptl)
     """
     os.makedirs(cfg.out_dir, exist_ok=True)
     wp.init()
     wp.set_device(cfg.device)
+
+    if cfg.input_file:
+        print(f"입자 입력: {cfg.input_file}")
+        inp = read_input(cfg.input_file)
+        cfg.override_from_input(inp.mass, inp.h)
+        pos_np, vel_np, ptl_type_np, n_ptl = inp.pos, inp.vel, inp.ptl_type, inp.n_ptl
+    else:
+        gen = particle_generation(cfg)
+        pos_np, vel_np, ptl_type_np, n_ptl = gen.build()
+
     print("=" * 78)
     print(cfg.summary())
     print("=" * 78)
-
-    gen = particle_generation(cfg)
-    base_np, ptl_type_np, n_ptl = gen.build()
-    base_pos, ptl_type = to_warp(base_np, ptl_type_np)
     print(f"입자 {len(ptl_type_np)} 개  "
           f"(유체 {n_ptl}, 경계 {len(ptl_type_np) - n_ptl})")
-    return base_pos, ptl_type, ptl_type_np, n_ptl
+
+    if cfg.dump_input:
+        os.makedirs(os.path.dirname(cfg.dump_input) or ".", exist_ok=True)
+        write_input(cfg.dump_input, pos_np, vel_np, ptl_type_np, cfg.mass, cfg.h)
+
+    base_pos, base_vel, ptl_type = to_warp(pos_np, vel_np, ptl_type_np)
+    return base_pos, base_vel, ptl_type, ptl_type_np, n_ptl
 
 
-def run_forward(cfg: Config, base_pos: wp.array, ptl_type: wp.array,
-                ptl_type_np: np.ndarray) -> None:
+def run_forward(cfg: Config, base_pos: wp.array, base_vel: wp.array,
+                ptl_type: wp.array, ptl_type_np: np.ndarray) -> None:
     """순방향 시뮬레이션을 돌리고 GIF 와 궤적을 저장한다."""
     print(f"\n[forward] {cfg.n_steps} 스텝  (t = {cfg.n_steps * cfg.dt:.3f} s)")
     # 순방향 데모는 유체 블록을 왼쪽 벽에 붙여 놓은 고전적인 dam break 다.
     offset = opt.offset_array(0.0, 0.0)
-    s0 = opt.ptl_place(cfg, base_pos, offset, ptl_type)
+    s0 = opt.ptl_place(cfg, base_pos, base_vel, offset, ptl_type)
 
     t0 = time.time()
     _, snaps = sim.simulate(cfg, s0, ptl_type, cfg.n_steps,
@@ -178,8 +199,8 @@ def run_forward(cfg: Config, base_pos: wp.array, ptl_type: wp.array,
         animate.save_trajectory(cfg, snaps, ptl_type_np, cfg.out_dir)
 
 
-def run_optimize(cfg: Config, base_pos: wp.array, ptl_type: wp.array,
-                 ptl_type_np: np.ndarray, n_ptl: int) -> None:
+def run_optimize(cfg: Config, base_pos: wp.array, base_vel: wp.array,
+                 ptl_type: wp.array, ptl_type_np: np.ndarray, n_ptl: int) -> None:
     """목표 상태를 만들고 초기 블록 위치를 복원한다."""
     print(f"\n[optimize] 시뮬레이션 {cfg.opt_sim_steps} 스텝 x 최적화 {cfg.opt_steps} 회")
     print("checkpoint 구성:")
@@ -187,14 +208,15 @@ def run_optimize(cfg: Config, base_pos: wp.array, ptl_type: wp.array,
 
     # 목표 상태: 참값 offset 으로 돌린 결과
     off_true = opt.offset_array(cfg.true_offset_x, cfg.true_offset_y)
-    s0_true = opt.ptl_place(cfg, base_pos, off_true, ptl_type)
+    s0_true = opt.ptl_place(cfg, base_pos, base_vel, off_true, ptl_type)
     s_target, _ = sim.simulate(cfg, s0_true, ptl_type, cfg.opt_sim_steps)
     pos_target = s_target.pos
     print(f"목표 상태 생성 완료 (true offset = "
           f"{cfg.true_offset_x:+.4f}, {cfg.true_offset_y:+.4f})\n")
 
     t0 = time.time()
-    offset, history = opt.optimization(cfg, base_pos, ptl_type, n_ptl, pos_target)
+    offset, history = opt.optimization(cfg, base_pos, base_vel, ptl_type, n_ptl,
+                                       pos_target)
     wp.synchronize()
     print(f"\n  {time.time() - t0:.1f} s")
 
@@ -221,16 +243,16 @@ def main() -> None:
         cfg.save(dump_config)
         print(f"설정 저장: {dump_config}")
 
-    base_pos, ptl_type, ptl_type_np, n_ptl = setup(cfg)
+    base_pos, base_vel, ptl_type, ptl_type_np, n_ptl = setup(cfg)
 
     if mode in ("check", "all"):
         from statistic import check_grad
         print("\n[check] 그래디언트 검증")
         check_grad.run_check(cfg)
     if mode in ("forward", "all"):
-        run_forward(cfg, base_pos, ptl_type, ptl_type_np)
+        run_forward(cfg, base_pos, base_vel, ptl_type, ptl_type_np)
     if mode in ("optimize", "all"):
-        run_optimize(cfg, base_pos, ptl_type, ptl_type_np, n_ptl)
+        run_optimize(cfg, base_pos, base_vel, ptl_type, ptl_type_np, n_ptl)
 
 
 if __name__ == "__main__":

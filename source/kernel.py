@@ -21,9 +21,9 @@ import math
 
 import warp as wp
 
-# 입자 종류
-PTL = wp.constant(wp.int32(0))          # 유체 입자
-BND = wp.constant(wp.int32(1))          # dummy boundary 입자
+# 입자 종류. SOPHIA 입력 형식과 같은 규약이다 (source/read_input.py).
+BND = wp.constant(wp.int32(0))          # dummy boundary 입자
+PTL = wp.constant(wp.int32(1))          # 유체 입자
 
 # 커널 종류 (Config.kernel_id 와 같은 값)
 CUBIC = wp.constant(wp.int32(0))
@@ -119,16 +119,22 @@ def kernel_dwdr(r: float, h: float, ker: int) -> float:
 @wp.kernel
 def place_ptl(
     base_pos: wp.array(dtype=wp.vec3),      # [#all, 3]
+    base_vel: wp.array(dtype=wp.vec3),      # [#all, 3]
     offset: wp.array(dtype=wp.vec3),        # [1, 3]
     ptl_type: wp.array(dtype=wp.int32),     # [#all]
-    s: State,                               # (출력) s.pos 만 쓴다
+    s: State,                               # (출력)
 ) -> None:
-    """유체 입자만 offset 만큼 평행이동한다. 최적화의 미분 대상이 offset 이다."""
+    """입력에서 읽은 초기 상태를 State 에 채운다.
+
+    유체 입자만 offset 만큼 평행이동한다. 최적화의 미분 대상이 그 offset 이다.
+    속도는 입력값을 그대로 쓴다.
+    """
     i = wp.tid()
     if ptl_type[i] == PTL:
         s.pos[i] = base_pos[i] + offset[0]
     else:
         s.pos[i] = base_pos[i]
+    s.vel[i] = base_vel[i]
 
 
 # ---------------------------------------------------------------- 1. 밀도

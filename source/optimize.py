@@ -39,19 +39,23 @@ def clamp_offset(cfg: Config, offset: wp.array) -> None:
 def ptl_place(
     cfg: Config,
     base_pos: wp.array,         # [#all, 3]
+    base_vel: wp.array,         # [#all, 3]
     offset: wp.array,           # [1, 3]
     ptl_type: wp.array,         # [#all]
     tape: wp.Tape | None = None,
 ) -> kn.State:
-    """offset 으로부터 초기 상태를 만든다. 속도는 0 이다. tape 를 주면 기록한다."""
+    """입력에서 읽은 초기 상태에 offset 을 얹어 State 를 만든다.
+
+    tape 를 주면 기록한다 (offset 에 대한 미분 경로).
+    """
     n = ptl_type.shape[0]
     s0 = sim.new_state(n, requires_grad=True)
+    args = [base_pos, base_vel, offset, ptl_type]
     if tape is None:
-        wp.launch(kn.place_ptl, dim=n, inputs=[base_pos, offset, ptl_type], outputs=[s0])
+        wp.launch(kn.place_ptl, dim=n, inputs=args, outputs=[s0])
     else:
         with tape:
-            wp.launch(kn.place_ptl, dim=n, inputs=[base_pos, offset, ptl_type],
-                      outputs=[s0])
+            wp.launch(kn.place_ptl, dim=n, inputs=args, outputs=[s0])
     return s0
 
 
@@ -73,6 +77,7 @@ def loss_and_grad(
     cfg: Config,
     offset: wp.array,           # [1, 3]
     base_pos: wp.array,         # [#all, 3]
+    base_vel: wp.array,         # [#all, 3]
     ptl_type: wp.array,         # [#all]
     pos_target: wp.array,       # [#all, 3]
     n_ptl: int,
@@ -97,7 +102,7 @@ def loss_and_grad(
     inv_n = 1.0 / float(n_ptl)
 
     tape0 = wp.Tape()
-    s0 = ptl_place(cfg, base_pos, offset, ptl_type, tape=tape0)
+    s0 = ptl_place(cfg, base_pos, base_vel, offset, ptl_type, tape=tape0)
 
     s_final, _ = sim.simulate(cfg, s0, ptl_type, n_steps, roll=roll)
     loss = loss_value(s_final, pos_target, ptl_type, inv_n)
@@ -122,6 +127,7 @@ def loss_and_grad(
 def optimization(
     cfg: Config,
     base_pos: wp.array,         # [#all, 3]
+    base_vel: wp.array,         # [#all, 3]
     ptl_type: wp.array,         # [#all]
     n_ptl: int,
     pos_target: wp.array,       # [#all, 3]
@@ -147,12 +153,13 @@ def optimization(
     for it in range(cfg.opt_steps):
         opt.lr = cfg.opt_lr * (cfg.opt_lr_decay ** it)
         loss, s_final = loss_and_grad(
-            cfg, offset, base_pos, ptl_type, pos_target, n_ptl, cfg.opt_sim_steps, roll
+            cfg, offset, base_pos, base_vel, ptl_type, pos_target, n_ptl,
+            cfg.opt_sim_steps, roll
         )
         g = offset.grad.numpy()[0].copy()
         o = offset.numpy()[0].copy()
 
-        s0_now = ptl_place(cfg, base_pos, offset, ptl_type)
+        s0_now = ptl_place(cfg, base_pos, base_vel, offset, ptl_type)
         history.append({
             "iter": it,
             "loss": loss,

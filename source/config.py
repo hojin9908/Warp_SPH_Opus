@@ -15,6 +15,8 @@ class Config:
 
     device: 계산에 쓸 디바이스 ("cuda:0", "cpu" ...)
     out_dir: 결과 저장 폴더
+    input_file: SOPHIA 형식 입자 입력 파일. 비어 있으면 설정값으로 생성한다
+    dump_input: 생성한 입자를 이 경로에 SOPHIA 형식으로 저장한다
     seed: 초기 배치 흔들림용 난수 시드
     dx: 입자 간격
     tank_width: 수조 내부 폭
@@ -59,6 +61,8 @@ class Config:
     # project property
     device: str = "cuda:0"
     out_dir: str = "outputs"
+    input_file: str = ""
+    dump_input: str = ""
     seed: int = 123
 
     # simulation setting
@@ -149,6 +153,23 @@ class Config:
             0.5 * self.tank_height - self.fluid_origin_y,
         )
 
+
+    def override_from_input(self, mass: float | None, h: float | None) -> None:
+        """입력 파일이 질량이나 h 를 줬으면 그 값을 쓴다.
+
+        파일이 설정보다 구체적인 입력이므로 파일이 이긴다. h 가 바뀌면 지지 반경과
+        (자동이었다면) dt 도 따라 바뀐다.
+        """
+        if mass is not None and abs(mass - self.mass) > 1e-12 * max(abs(mass), 1.0):
+            print(f"  [config] 질량을 입력 파일 값으로 바꾼다: {self.mass:g} -> {mass:g}")
+            self.mass = mass
+        if h is not None and abs(h - self.h) > 1e-12 * max(abs(h), 1.0):
+            print(f"  [config] h 를 입력 파일 값으로 바꾼다: {self.h:g} -> {h:g}")
+            self.h = h
+            self.auto_h = False
+            self.support = 2.0 * self.h
+            if self.auto_dt:
+                self.dt = self.cfl * self.h / self.c0
 
     def to_dict(self) -> dict[str, Any]:
         """dataclass 필드만 dict 로 돌려준다. 자동 계산이었던 값은 0 인 채로 남긴다."""

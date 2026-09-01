@@ -9,9 +9,7 @@ import numpy as np
 import warp as wp
 
 from source.config import Config
-
-PTL = 0     # 유체 입자
-BND = 1     # dummy boundary 입자
+from source.read_input import BND, PTL
 
 
 class particle_generation:
@@ -61,13 +59,15 @@ class particle_generation:
             walls.append(np.stack([np.full_like(ys, cfg.tank_width + k * dx), ys], axis=1))
         return np.concatenate(walls, axis=0)                     # [#bnd, 2]
 
-    def build(self) -> tuple[np.ndarray, np.ndarray, int]:
+    def build(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
         """유체와 경계를 한 배열로 합친다.
 
         유체를 앞에, 경계를 뒤에 둔다. HashGrid 는 전체 입자 위에 하나만 만든다.
+        결과는 read_input() 이 파일에서 읽어 오는 것과 같은 모양이다.
 
         return:
             base_pos  # [#all, 3]  z 성분은 0
+            base_vel  # [#all, 3]  생성할 때는 전부 0
             ptl_type  # [#all]     PTL 또는 BND
             n_ptl     # 유체 입자 수
         """
@@ -85,14 +85,18 @@ class particle_generation:
         base_pos = np.zeros((len(xy), 3), dtype=np.float32)      # [#all, 3]
         base_pos[:, 0] = xy[:, 0]
         base_pos[:, 1] = xy[:, 1]
-        return base_pos, ptl_type, len(ptl)
+        base_vel = np.zeros((len(xy), 3), dtype=np.float32)      # [#all, 3]
+        return base_pos, base_vel, ptl_type, len(ptl)
 
 
-def to_warp(base_pos: np.ndarray, ptl_type: np.ndarray) -> tuple[wp.array, wp.array]:
+def to_warp(base_pos: np.ndarray, base_vel: np.ndarray,
+            ptl_type: np.ndarray) -> tuple[wp.array, wp.array, wp.array]:
     """numpy 배열을 Warp 배열로 올린다.
 
     base_pos: 초기 위치     # [#all, 3]
+    base_vel: 초기 속도     # [#all, 3]
     ptl_type: 입자 종류     # [#all]
-    return: (wp.vec3 배열, wp.int32 배열)
     """
-    return wp.array(base_pos, dtype=wp.vec3), wp.array(ptl_type, dtype=wp.int32)
+    return (wp.array(base_pos, dtype=wp.vec3),
+            wp.array(base_vel, dtype=wp.vec3),
+            wp.array(ptl_type, dtype=wp.int32))
