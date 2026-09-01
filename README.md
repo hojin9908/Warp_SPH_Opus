@@ -219,14 +219,44 @@ python main.py --mode forward                   # 기본 h = 1.3 * dx
 `wp.Tape` 는 커널 런치를 기록한다. 다중 스텝을 역전파하려면 두 가지를 지켜야 한다.
 
 1. **스텝마다 상태 배열을 따로 잡는다.** in-place 갱신 금지.
-   `vel_pos_step` 이 `pos_in → pos_out` 으로 out-of-place 인 이유다.
-2. **스텝마다 HashGrid 를 따로 잡는다.** grid 객체 하나를 `build()` 로 덮어쓰면
-   **정방향 결과는 완전히 같고 역방향만 조용히 틀린다.** 앞 스텝의 backward 가
-   마지막 스텝의 이웃 목록으로 미분하기 때문이다.
-   `checkpoint.backward_taped()` 가 `grids = [new_grid(...) for _ in range(n)]` 로
-   리스트에 붙잡아 두는 이유다 (GC 되면 use-after-free).
+   `vel_pos_step` 이 `s_in → s_out` 으로 out-of-place 인 이유다.
+2. **스텝마다 HashGrid 를 따로 잡는다.** 이게 진짜로 어기면 안 되는 쪽이다.
 
-`grid.build()` 는 미분 대상이 아니므로 항상 `with tape:` **밖**에서 부른다.
+### 왜 스텝마다 별도의 grid 객체여야 하나
+
+grid 객체 하나를 `build()` 로 덮어쓰면 backward 시점에는 **마지막 스텝의 이웃
+목록만** 남아 있다. 앞 스텝들의 adjoint 가 남의 이웃 목록으로 미분한다.
+**정방향은 매 스텝 rebuild 하므로 결과가 비트 단위로 같고, 역방향만 조용히 틀린다.**
+
+실측 (CPU, dx=0.05, 셀 크기 0.13 m):
+
+| 스텝 수 | 구간 시간 | 입자 이동량 | 정방향 차이 | 그래디언트 오차 |
+|--:|--:|--:|--:|--:|
+| 60 | 0.031 s | 0.005 m | 0 | 0.0% |
+| 150 | 0.078 s | 0.030 m | 0 | 0.0% |
+| 300 | 0.156 s | 0.191 m | 0 | **100%** |
+| 600 | 0.311 s | 0.705 m | 0 | **1324%** |
+
+**입자가 셀 크기만큼 움직이기 전에는 오차가 0 이다.** 낡은 grid 의 후보 집합이
+아직 참 이웃의 상위집합이라 커널 안의 `if r2 < support²` 가 걸러 주기 때문이다.
+그래서 짧게 돌린 테스트에서는 이 버그가 숨는다. 검증은 실제 구간 길이로 해야 한다.
+
+`checkpoint.backward_taped()` 가 `grids = [new_grid(...) for _ in range(n)]` 로
+리스트에 붙잡아 두는 이유다 (GC 되면 use-after-free).
+
+### `grid.build()` 를 `with tape:` 밖에서 부르는 이유
+
+이웃 탐색은 위치를 정수 셀 번호로 바꾸는 이산 연산이라 미분 대상이 아니다.
+Warp 도 같은 입장이다 — `warp/native/hashgrid.h` 의 `iter_reverse` 는 받은 질의를
+그대로 돌려주고 주석이 `can't reverse grid queries` 다.
+
+다만 **Warp 1.16 에서는 `with tape:` 안에 넣어도 실제로는 아무 일도 일어나지 않는다.**
+`HashGrid.build()` 가 `wp.launch` 가 아니라 네이티브 함수를 직접 부르기 때문에
+테이프가 아예 보지 못한다. 안팎을 바꿔가며 재 보면 테이프에 쌓인 런치 수가
+스텝당 5개로 같고 그래디언트도 비트 단위로 같다.
+
+그래도 밖에 두는 것은 (1) 코드만 봐도 미분 경계가 어디인지 드러나고,
+(2) "Warp 가 마침 기록하지 않는다" 에 기대지 않기 위해서다.
 
 ## 7. Recursive checkpointing
 
